@@ -9,47 +9,47 @@ sin funciones de alto nivel (scipy.signal, fft, etc.).
 Para ejecutar:  python app.py
 """
 
+import csv
 import math
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
 import numpy as np
 from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_tkagg import (
+    FigureCanvasTkAgg, NavigationToolbar2Tk
+)
 
 
 # ==============================================================
 # CONSTANTES
 # ==============================================================
 
-# Periodo de todas las señales y valores derivados
 PERIODO_T = 2.0                              # s
-FRECUENCIA_F0 = 1.0 / PERIODO_T              # Hz (frecuencia fundamental)
+FRECUENCIA_F0 = 1.0 / PERIODO_T              # Hz
 FRECUENCIA_W0 = 2.0 * math.pi / PERIODO_T    # rad/s
 
-# Valores de armónicos exigidos por los requerimientos
 ARMONICOS_VALORES = [1, 2, 3, 5, 10, 20, 50, 100, 150, 200]
 
-# Nombres de las señales
 SENAL_CUADRADA = "Señal Cuadrada"
 SENAL_TRIANGULAR = "Señal Triangular"
 SENAL_SIERRA = "Señal Diente de Sierra"
 SENALES = [SENAL_CUADRADA, SENAL_TRIANGULAR, SENAL_SIERRA]
 
-# Intervalo de visualización por defecto y límites permitidos
 T_INICIAL_DEFECTO = "0"
 T_FINAL_DEFECTO = "6"
-DURACION_MINIMA = 0.01       # s
-DURACION_MAXIMA = 100.0      # s
-LIMITE_TIEMPO = 1000.0       # s (valor absoluto máximo de ti y tf)
+DURACION_MINIMA = 0.01
+DURACION_MAXIMA = 100.0
+LIMITE_TIEMPO = 1000.0
 
-# Muestreo para visualizar (se ajusta para evitar aliasing)
-MUESTRAS_POR_CICLO = 40      # muestras por ciclo del armónico más alto
+MUESTRAS_POR_CICLO = 40
 MUESTRAS_MINIMAS = 2000
 MUESTRAS_MAXIMAS = 300000
 
-# Muestras (en un periodo T) para calcular las métricas
 MUESTRAS_METRICAS = 20000
+
+# Tope de elementos por bloque al vectorizar (controla el uso de memoria)
+ELEMENTOS_POR_BLOQUE = 2_000_000
 
 
 # ==============================================================
@@ -85,7 +85,7 @@ def coeficientes_serie(tipo, N):
     Devuelve (n, coef, base):
       n    : índices de armónicos 1..N
       coef : coeficiente de cada armónico
-      base : función base (np.sin o np.cos) que multiplica a cada coeficiente
+      base : función base (np.sin o np.cos)
 
     Cuadrada:    b_n = 4/(n*pi)             (n impar, senos)
     Triangular:  a_n = 8/(n*pi)^2           (n impar, cosenos)
@@ -109,13 +109,26 @@ def coeficientes_serie(tipo, N):
 
 
 def reconstruir_serie(t, tipo, N):
-    """Señal reconstruida x_hat(t) con N armónicos."""
+    """
+    Señal reconstruida x_hat(t) con N armónicos.
+    Se procesan los armónicos por bloques (vectorizado) para ser rápido
+    sin consumir demasiada memoria.
+    """
     n, coef, base = coeficientes_serie(tipo, N)
-    x_rec = np.zeros_like(t, dtype=float)
+    t = np.asarray(t, dtype=float)
+    x_rec = np.zeros_like(t)
 
-    for ni, ci in zip(n, coef):
-        if ci != 0.0:
-            x_rec += ci * base(ni * FRECUENCIA_W0 * t)
+    # Solo los armónicos con coeficiente no nulo
+    activos = coef != 0.0
+    n, coef = n[activos], coef[activos]
+
+    tam_bloque = max(1, ELEMENTOS_POR_BLOQUE // max(1, t.size))
+
+    for i in range(0, n.size, tam_bloque):
+        ni = n[i:i + tam_bloque]
+        ci = coef[i:i + tam_bloque]
+        argumento = np.outer(ni * FRECUENCIA_W0, t)   # (bloque, muestras)
+        x_rec += ci @ base(argumento)
 
     return x_rec
 
@@ -141,6 +154,18 @@ def tiempo_metricas():
     return (k + 0.5) * PERIODO_T / MUESTRAS_METRICAS
 
 
+def _armar_metricas(N, x, x_rec, suma_c2):
+    mse = calcular_mse(x, x_rec)
+    return {
+        "N": N,
+        "MSE": mse,
+        "RMSE": math.sqrt(mse),
+        "P_original": calcular_potencia(x),
+        "P_reconstruida": calcular_potencia(x_rec),
+        "P_parseval": suma_c2 / 2.0,
+    }
+
+
 def calcular_metricas(tipo, N):
     """
     Métricas sobre un periodo completo (no dependen del intervalo
@@ -150,22 +175,46 @@ def calcular_metricas(tipo, N):
     x = generar_senal(t, tipo)
     x_rec = reconstruir_serie(t, tipo, N)
     _, coef, _ = coeficientes_serie(tipo, N)
+    return _armar_metricas(N, x, x_rec, float(np.sum(coef ** 2)))
 
-    mse = calcular_mse(x, x_rec)
-    return {
-        "N": N,
-        "MSE": mse,
-        "RMSE": math.sqrt(mse),
-        "P_original": calcular_potencia(x),
-        "P_reconstruida": calcular_potencia(x_rec),
-        "P_parseval": potencia_parseval(coef),
-    }
+
+def metricas_todas(tipo, valores=ARMONICOS_VALORES):
+    """
+    Métricas para todos los N en UNA sola pasada: se acumulan los
+    armónicos uno a uno y se toma una 'foto' cuando n coincide con
+    alguno de los N pedidos (evita reconstruir desde cero cada vez).
+    """
+    validar_tipo(tipo)
+    t = tiempo_metricas()
+    x = generar_senal(t, tipo)
+
+    n_max = max(valores)
+    n, coef, base = coeficientes_serie(tipo, n_max)
+    pedidos = set(valores)
+
+    acumulada = np.zeros_like(t)
+    suma_c2 = 0.0
+    resultados = []
+
+    for ni, ci in zip(n, coef):
+        if ci != 0.0:
+            acumulada += ci * base(ni * FRECUENCIA_W0 * t)
+            suma_c2 += float(ci) ** 2
+        if int(ni) in pedidos:
+            resultados.append(_armar_metricas(int(ni), x, acumulada, suma_c2))
+
+    return resultados
+
+
+def muestras_requeridas(duracion, N):
+    """Muestras ideales para ver bien el armónico N (evita aliasing)."""
+    return int(MUESTRAS_POR_CICLO * N * FRECUENCIA_F0 * duracion)
 
 
 def numero_muestras(duracion, N):
-    """Muestras necesarias para ver bien el armónico N (evita aliasing)."""
-    n = int(MUESTRAS_POR_CICLO * N * FRECUENCIA_F0 * duracion)
-    return max(MUESTRAS_MINIMAS, min(n, MUESTRAS_MAXIMAS))
+    """Muestras usadas, acotadas a los límites de la aplicación."""
+    return max(MUESTRAS_MINIMAS,
+               min(muestras_requeridas(duracion, N), MUESTRAS_MAXIMAS))
 
 
 # ==============================================================
@@ -235,13 +284,12 @@ class FourierApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Reconstrucción de Señales - Series de Fourier")
-        self.root.geometry("1250x850")
-        self.root.minsize(1100, 750)
+        self.root.geometry("1250x900")
+        self.root.minsize(1100, 780)
         self.root.protocol("WM_DELETE_WINDOW", self.cerrar)
 
         self.crear_interfaz()
 
-        # Valores iniciales
         self.cb_senal.current(0)
         self.cb_armonicos.current(ARMONICOS_VALORES.index(10))  # N = 10
 
@@ -306,13 +354,14 @@ class FourierApp:
         self.entry_tf.insert(0, T_FINAL_DEFECTO)
         self.entry_tf.grid(row=0, column=7, padx=5)
 
-        # Actualización inmediata al cambiar señal, N o presionar Enter
+        # Actualización inmediata: selección, Enter o al salir del campo
         self.cb_senal.bind("<<ComboboxSelected>>", self.actualizar_graficas)
         self.cb_armonicos.bind(
             "<<ComboboxSelected>>", self.actualizar_graficas
         )
-        self.entry_ti.bind("<Return>", self.actualizar_graficas)
-        self.entry_tf.bind("<Return>", self.actualizar_graficas)
+        for entrada in (self.entry_ti, self.entry_tf):
+            entrada.bind("<Return>", self.actualizar_graficas)
+            entrada.bind("<FocusOut>", self.actualizar_graficas)
 
         # ---------------- Botones ----------------
         botones = tk.Frame(control_frame)
@@ -330,6 +379,11 @@ class FourierApp:
 
         tk.Button(
             botones, text="ANÁLISIS N", command=self.mostrar_analisis,
+            font=("Arial", 10, "bold"), padx=12
+        ).pack(side=tk.LEFT, padx=8)
+
+        tk.Button(
+            botones, text="EXPORTAR CSV", command=self.exportar_csv,
             font=("Arial", 10, "bold"), padx=12
         ).pack(side=tk.LEFT, padx=8)
 
@@ -358,17 +412,29 @@ class FourierApp:
                          self.lbl_pot_rec, self.lbl_pot_par):
             etiqueta.pack(side=tk.LEFT, padx=12)
 
-        # ---------------- Figura con 4 gráficas ----------------
+        # ---------------- Barra de estado ----------------
+        self.lbl_estado = tk.Label(
+            self.root, text="Listo.", anchor="w", fg="#333333",
+            font=("Arial", 9)
+        )
+        self.lbl_estado.pack(side=tk.BOTTOM, fill=tk.X, padx=10)
+
+        # ---------------- Figura con 4 gráficas + toolbar ----------------
+        zona_grafica = tk.Frame(self.root)
+        zona_grafica.pack(side=tk.TOP, fill=tk.BOTH, expand=True,
+                          padx=10, pady=5)
+
         self.fig = Figure(figsize=(11, 6.5), dpi=100)
         self.ax1 = self.fig.add_subplot(221)
         self.ax2 = self.fig.add_subplot(222)
         self.ax3 = self.fig.add_subplot(223)
         self.ax4 = self.fig.add_subplot(224)
 
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
-        self.canvas.get_tk_widget().pack(
-            side=tk.BOTTOM, fill=tk.BOTH, expand=True, padx=10, pady=5
-        )
+        self.canvas = FigureCanvasTkAgg(self.fig, master=zona_grafica)
+        barra = NavigationToolbar2Tk(self.canvas, zona_grafica)
+        barra.update()
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH,
+                                         expand=True)
 
     # ----------------------------------------------------------
     # Lectura de parámetros
@@ -382,6 +448,9 @@ class FourierApp:
         ti, tf = validar_intervalo(self.entry_ti.get(), self.entry_tf.get())
         return tipo, N, ti, tf
 
+    def estado(self, texto, error=False):
+        self.lbl_estado.config(text=texto, fg="#B00020" if error else "#333333")
+
     # ----------------------------------------------------------
     # Actualizar las 4 gráficas y las métricas
     # ----------------------------------------------------------
@@ -391,13 +460,13 @@ class FourierApp:
         try:
             tipo, N, ti, tf = self.obtener_parametros()
 
-            # Señales en el intervalo pedido
-            t = np.linspace(ti, tf, numero_muestras(tf - ti, N))
+            duracion = tf - ti
+            n_muestras = numero_muestras(duracion, N)
+            t = np.linspace(ti, tf, n_muestras)
             x_orig = generar_senal(t, tipo)
             x_rec = reconstruir_serie(t, tipo, N)
             error = np.abs(x_orig - x_rec)
 
-            # Espectro de línea y métricas
             n, coef, _ = coeficientes_serie(tipo, N)
             frecuencias = n * FRECUENCIA_F0
             amplitudes = np.abs(coef)
@@ -450,9 +519,24 @@ class FourierApp:
             self.fig.tight_layout()
             self.canvas.draw()
 
+            # Aviso de aliasing si el muestreo quedó limitado
+            if muestras_requeridas(duracion, N) > MUESTRAS_MAXIMAS:
+                self.estado(
+                    "Aviso: el intervalo y N son grandes; el muestreo se "
+                    "limitó y la gráfica puede mostrar aliasing. "
+                    "Reduzca el intervalo.", error=True
+                )
+            else:
+                self.estado(
+                    f"{tipo} | N = {N} | [{ti:g}, {tf:g}] s | "
+                    f"{n_muestras} muestras"
+                )
+
         except ValueError as e:
+            self.estado(str(e), error=True)
             messagebox.showerror("Error de entrada", str(e))
         except Exception as e:
+            self.estado("Error durante el cálculo.", error=True)
             messagebox.showerror(
                 "Error", f"Ocurrió un error durante el cálculo:\n\n{e}"
             )
@@ -464,7 +548,7 @@ class FourierApp:
     def calcular_resultados(self):
         tipo = self.cb_senal.get()
         validar_tipo(tipo)
-        return [calcular_metricas(tipo, N) for N in ARMONICOS_VALORES]
+        return metricas_todas(tipo)
 
     # ----------------------------------------------------------
     # Ventana con la tabla de resultados
@@ -524,6 +608,50 @@ class FourierApp:
             )
 
     # ----------------------------------------------------------
+    # Exportar la tabla de resultados (las 3 señales) a CSV
+    # ----------------------------------------------------------
+
+    def exportar_csv(self):
+
+        try:
+            ruta = filedialog.asksaveasfilename(
+                title="Guardar tabla de resultados",
+                defaultextension=".csv",
+                initialfile="resultados_fourier.csv",
+                filetypes=[("CSV", "*.csv")]
+            )
+            if not ruta:
+                return
+
+            with open(ruta, "w", newline="", encoding="utf-8-sig") as f:
+                escritor = csv.writer(f, delimiter=";")
+                escritor.writerow([
+                    "Señal", "N", "MSE", "RMSE", "P_original",
+                    "P_reconstruida", "P_parseval"
+                ])
+                for tipo in SENALES:
+                    for r in metricas_todas(tipo):
+                        escritor.writerow([
+                            tipo, r["N"],
+                            f"{r['MSE']:.8e}", f"{r['RMSE']:.8e}",
+                            f"{r['P_original']:.8f}",
+                            f"{r['P_reconstruida']:.8f}",
+                            f"{r['P_parseval']:.8f}",
+                        ])
+
+            self.estado(f"Tabla exportada en: {ruta}")
+            messagebox.showinfo("Exportación", "Tabla exportada con éxito.")
+
+        except OSError as e:
+            messagebox.showerror(
+                "Error", f"No se pudo escribir el archivo:\n\n{e}"
+            )
+        except Exception as e:
+            messagebox.showerror(
+                "Error", f"No se pudo exportar la tabla:\n\n{e}"
+            )
+
+    # ----------------------------------------------------------
     # Ventana con gráficas de análisis (MSE y potencia vs N)
     # ----------------------------------------------------------
 
@@ -567,6 +695,8 @@ class FourierApp:
 
             fig.tight_layout()
             canvas = FigureCanvasTkAgg(fig, master=ventana)
+            barra = NavigationToolbar2Tk(canvas, ventana)
+            barra.update()
             canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
             canvas.draw()
             ventana.canvas = canvas   # evita que Python lo elimine
