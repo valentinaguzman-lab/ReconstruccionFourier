@@ -4,9 +4,9 @@ Universidad del Cauca - Facultad de Ingeniería Electrónica y Telecomunicacione
 Telecomunicaciones Digitales - Señales y Sistemas
 
 **Integrantes:**
-- Nombre Apellido 1
-- Nombre Apellido 2
-- Nombre Apellido 3
+- Valentina Guzmán Bolaños
+- Miguel Angel Franco Narvaez
+- Sergio Estiven Castro Jimenez
 
 ## Descripción
 
